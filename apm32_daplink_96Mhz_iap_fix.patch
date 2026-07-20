@@ -1,0 +1,152 @@
+From: DAPLink APM32 Port
+Date: 2026-07-20
+Subject: [PATCH] APM32F103CBT6: 96MHz support + IAP cold boot fix
+
+Changes:
+1. stm32f103xb_bl.c: Fix flash_regions[0].end to stop at IF boundary (0x0801FC00)
+   instead of full chip (0x08020000), preventing EraseChip from erasing config region.
+2. sdk.c: Differentiated clock - BL=72MHz(IAP safe), IF=96MHz(fast DAP).
+   Added Flash prefetch buffer, USBDPSC divider for 96MHz.
+3. flash.c: Fix EraseChip assert - use modulo instead of divide for alignment check.
+4. daplink_addr.h: IF=79KB as shipped (unchanged, included for reference).
+
+---
+ source/board/stm32f103xb_bl.c                    |    3 +-
+ source/hic_hal/stm32/stm32f103xb/sdk.c           |   36 ++++++++++++++--
+ source/hic_hal/stm32/stm32f103xb/flash.c         |    2 +-
+ source/hic_hal/stm32/stm32f103xb/daplink_addr.h  |    4 +-
+ 4 files changed, 38 insertions(+), 7 deletions(-)
+
+diff --git a/source/board/stm32f103xb_bl.c b/source/board/stm32f103xb_bl.c
+--- a/source/board/stm32f103xb_bl.c
++++ b/source/board/stm32f103xb_bl.c
+@@ -22,7 +22,8 @@
+ 
+ #include "target_config.h"
+ #include "target_board.h"
+ #include "target_family.h"
++#include "daplink_addr.h"
+ 
+ /**
+ * List of start and size for each size of flash sector
+@@ -40,7 +41,7 @@ static const sector_info_t sectors_info[] = {
+ target_cfg_t target_device = {
+     .version                    = kTargetConfigVersion,
+     .sectors_info               = sectors_info,
+     .sector_info_length         = (sizeof(sectors_info))/(sizeof(sector_info_t)),
+     .flash_regions[0].start     = 0x08000000 + KB(48),
+-    .flash_regions[0].end       = 0x08000000 + KB(128),
++    .flash_regions[0].end       = DAPLINK_ROM_IF_START + DAPLINK_ROM_IF_SIZE,
+     .flash_regions[0].flags     = kRegionIsDefault,
+     .ram_regions[0].start       = 0x20000000,
+     .ram_regions[0].end         = 0x20005000,
+
+diff --git a/source/hic_hal/stm32/stm32f103xb/sdk.c b/source/hic_hal/stm32/stm32f103xb/sdk.c
+--- a/source/hic_hal/stm32/stm32f103xb/sdk.c
++++ b/source/hic_hal/stm32/stm32f103xb/sdk.c
+@@ -29,13 +29,42 @@
+ 
+ #include "daplink.h"
+ 
++/* APM32F103CBT6 supports up to 3 Flash wait states for 96MHz operation */
++#ifndef FLASH_LATENCY_3
++#define FLASH_LATENCY_3                 0x00000003U
++#endif
++
++/*
++ * BL runs at 72MHz (compatible IAP flash timing)
++ * IF runs at 96MHz (faster DAP operations)
++ * 96MHz config per APM32 SDK: PLL HSE*12, Flash WS=3, enable prefetch buffer
++ */
++#if defined(DAPLINK_BL)
++#define APM32_PLL_MUL                  RCC_PLL_MUL9
++#define APM32_FLASH_LATENCY            FLASH_LATENCY_2
++#else
++#define APM32_PLL_MUL                  RCC_PLL_MUL12
++#define APM32_FLASH_LATENCY            FLASH_LATENCY_3
++#endif
++
+ TIM_HandleTypeDef timer;
+ uint32_t time_count;
+ 
+ static uint32_t tim2_clk_div(uint32_t apb1clkdiv);
+ 
+ /**
+-    * @brief  Switch the PLL source from HSI to HSE bypass, and select the PLL as SYSCLK
++    * @brief  Switch the PLL source from HSI to HSE bypass, and select the PLL
++    *         as SYSCLK.
++    *
++    *         BL(72MHz): PLL_MUL9(HSE 8MHz), Flash WS=2
++    *         IF(96MHz): PLL_MUL12(HSE 8MHz), Flash WS=3, USBDPSC=48MHz
++    *
++    *         NOTE: Flash prefetch buffer must be enabled BEFORE switching to
++    *         PLL clock, per APM32 SDK SystemClock96M() sequence.
++    *
++    *         Clock tree:
++    *           HSE 8MHz --/1--> PLL --MUL--> 72/96MHz
++    *                              |
++    *                              +--/2--> APB1 (36/48MHz)
++    *                              +--/1--> APB2 (72/96MHz)
+   *         source.
+   *         The system Clock is configured as follow :
+   *            System Clock source            = PLL (HSE bypass)
+@@ -85,7 +114,7 @@ void sdk_init()
+     RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+     RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+     RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+-    RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
++    RCC_OscInitStruct.PLL.PLLMUL = APM32_PLL_MUL;
+     if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+         /* Initialization Error */
+         util_assert(0);
+@@ -97,9 +126,16 @@ void sdk_init()
+     RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+     RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+ 
+-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
++    /* Enable Flash prefetch buffer before switching to high-speed PLL
++     * Per APM32 SDK SystemClock96M(): FMC->CTRL1_B.PBEN = BIT_SET */
++    __HAL_FLASH_PREFETCH_BUFFER_ENABLE();
++
++    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, APM32_FLASH_LATENCY) != HAL_OK) {
+         /* Initialization Error */
+         util_assert(0);
+     }
++
++#if defined(DAPLINK_IF)
++    /* USB clock divider: 96MHz PLL / 2 = 48MHz USB
++     * CFGR bits [23:22] (USBDPSC) = 2 (binary 10)
++     * SystemInit resets USBDIV bits, must be set for 96MHz */
++    RCC->CFGR |= (uint32_t)(1UL << 23);
++#endif
+ }
+
+diff --git a/source/hic_hal/stm32/stm32f103xb/flash.c b/source/hic_hal/stm32/stm32f103xb/flash.c
+--- a/source/hic_hal/stm32/stm32f103xb/flash.c
++++ b/source/hic_hal/stm32/stm32f103xb/flash.c
+@@ -63,7 +63,7 @@ uint32_t EraseChip(void)
+     if (g_board_info.target_cfg) {
+         HAL_FLASH_Unlock();
+         //bootloader, interface flashing only concerns 1 flash region
+-        util_assert((g_board_info.target_cfg->flash_regions[0].end - g_board_info.target_cfg->flash_regions[0].start) /
++        util_assert((g_board_info.target_cfg->flash_regions[0].end - g_board_info.target_cfg->flash_regions[0].start) %
+                     FLASH_PAGE_SIZE == 0);
+         memset(&erase_init, 0, sizeof(erase_init));
+         erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
+
+diff --git a/source/hic_hal/stm32/stm32f103xb/daplink_addr.h b/source/hic_hal/stm32/stm32f103xb/daplink_addr.h
+--- a/source/hic_hal/stm32/stm32f103xb/daplink_addr.h
++++ b/source/hic_hal/stm32/stm32f103xb/daplink_addr.h
+@@ -35,7 +35,7 @@
+ 
+ #define DAPLINK_ROM_BL_START            0x08000000
+-#define DAPLINK_ROM_BL_SIZE             0x0000C000
++#define DAPLINK_ROM_BL_SIZE             0x0000C000  /* 48KB */
+ 
+ #define DAPLINK_ROM_IF_START            0x0800C000
+-#define DAPLINK_ROM_IF_SIZE             0x00013C00
++#define DAPLINK_ROM_IF_SIZE             0x00013C00  /* 79KB, contiguous with config */
+ 
+ #define DAPLINK_ROM_CONFIG_USER_START   0x0801FC00
+-#define DAPLINK_ROM_CONFIG_USER_SIZE    0x00000400
++#define DAPLINK_ROM_CONFIG_USER_SIZE    0x00000400  /* 1KB */
