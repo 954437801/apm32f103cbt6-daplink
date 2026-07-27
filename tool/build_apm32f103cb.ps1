@@ -18,11 +18,10 @@
 
 # APM32F103CB DAPLink build script
 # Build with progen_compile.py and GCC ARM toolchain
-# Usage: powershell -ExecutionPolicy Bypass -File tools\build_apm32f103cb.ps1
+# Usage: .\build_apm32f103cb.ps1
 
-# Get script directory and change to project root
-$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-$daplinkDir = Split-Path -Parent $scriptPath
+# Script runs from project root, use $PSScriptRoot as working directory
+$daplinkDir = $PSScriptRoot
 Set-Location $daplinkDir
 Write-Host "Working directory: $daplinkDir"
 
